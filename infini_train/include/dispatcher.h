@@ -21,7 +21,8 @@ public:
         // =================================== 作业 ===================================
 
         using FuncT = RetT (*)(ArgsT...);
-        // TODO: 实现函数调用逻辑
+        CHECK(func_ptr_ != nullptr) << "Calling an empty kernel function";
+        return reinterpret_cast<FuncT>(func_ptr_)(std::forward<ArgsT>(args)...);
     }
 
 private:
@@ -48,6 +49,10 @@ public:
         // TODO：实现kernel注册机制
         // 功能描述：将kernel函数与设备类型、名称绑定
         // =================================== 作业 ===================================
+
+        CHECK(!key_to_kernel_map_.contains(key))
+            << "Kernel already registered: " << key.second << " on device: " << static_cast<int>(key.first);
+        key_to_kernel_map_.emplace(key, KernelFunction(std::forward<FuncT>(kernel)));
     }
 
 private:
@@ -55,8 +60,19 @@ private:
 };
 } // namespace infini_train
 
+// =================================== 作业 ===================================
+// TODO：实现自动注册宏
+// 功能描述：在全局静态区注册kernel，避免显式初始化代码
+// =================================== 作业 ===================================
+
+// 两层间接展开，保证 __COUNTER__ 先求值再拼接，避免同一作用域内多次注册时变量重名。
+#define INFINI_TRAIN_CONCAT_IMPL(lhs, rhs) lhs##rhs
+#define INFINI_TRAIN_CONCAT(lhs, rhs) INFINI_TRAIN_CONCAT_IMPL(lhs, rhs)
+
+// 借助静态存储期变量的初始化，在 main 之前完成注册。
+// 展开为一条声明语句，因此在命名空间作用域与函数作用域下均可使用。
 #define REGISTER_KERNEL(device, kernel_name, kernel_func)                                                              \
-    // =================================== 作业 ===================================
-    // TODO：实现自动注册宏
-    // 功能描述：在全局静态区注册kernel，避免显式初始化代码
-    // =================================== 作业 ===================================
+    static const bool INFINI_TRAIN_CONCAT(kInfiniTrainKernelRegistered_, __COUNTER__) = []() {                         \
+        ::infini_train::Dispatcher::Instance().Register({device, #kernel_name}, kernel_func);                          \
+        return true;                                                                                                   \
+    }();

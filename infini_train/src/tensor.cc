@@ -283,7 +283,34 @@ std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // HINT:
     // =================================== 作业 ===================================
 
-    return std::make_shared<Tensor>();
+    const int64_t rank = static_cast<int64_t>(dims_.size());
+    // 标量按 PyTorch 语义展平成一维
+    if (rank == 0) {
+        return Contiguous()->View({1});
+    }
+
+    // 支持负数索引
+    if (start < 0) {
+        start += rank;
+    }
+    if (end < 0) {
+        end += rank;
+    }
+    CHECK_GE(start, 0);
+    CHECK_LT(start, rank);
+    CHECK_GE(end, 0);
+    CHECK_LT(end, rank);
+    CHECK_LE(start, end) << "flatten range [" << start << ", " << end << "] is invalid";
+
+    std::vector<int64_t> new_shape;
+    new_shape.reserve(rank - (end - start));
+    new_shape.insert(new_shape.end(), dims_.begin(), dims_.begin() + start);
+    new_shape.push_back(
+        std::accumulate(dims_.begin() + start, dims_.begin() + end + 1, int64_t{1}, std::multiplies<int64_t>{}));
+    new_shape.insert(new_shape.end(), dims_.begin() + end + 1, dims_.end());
+
+    // 先 Contiguous 保证底层数据按行优先连续排布，再改写形状
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -358,6 +385,23 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
     // TODO：实现自动微分反向传播
     // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
     // =================================== 作业 ===================================
+
+    // 叶子张量没有 grad_fn，反向图到此为止
+    if (!grad_fn_) {
+        return;
+    }
+
+    // 未显式指定初始梯度时默认为全 1（等价于对 sum 求导）
+    if (!gradient) {
+        gradient = std::make_shared<Tensor>(dims_, dtype_, GetDevice());
+        gradient->Fill<float>(1.0f);
+    }
+    CHECK_EQ(gradient->NumElements(), num_elements_) << "gradient shape mismatch in Backward";
+
+    // 交给反向引擎：Function::BackwardPartial 内部按依赖计数触发本节点的 Backward，
+    // 并沿 next_functions_ 递归回传，叶子节点的 AccumulateGrad 会把梯度累加进 grad_。
+    // 多次调用 Backward（多输出场景）会累加到同一份叶子梯度上。
+    grad_fn_->BackwardPartial(gradient, output_idx_);
 }
 
 void Tensor::ZeroGrad() {

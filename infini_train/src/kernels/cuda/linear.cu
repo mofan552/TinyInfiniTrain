@@ -1,6 +1,10 @@
 #include "cublas_v2.h"
 #include "glog/logging.h"
+#include <algorithm>
 #include <cub/block/block_reduce.cuh>
+#include <numeric>
+#include <tuple>
+#include <vector>
 
 #include "infini_train/include/dispatcher.h"
 #include "infini_train/include/tensor.h"
@@ -23,13 +27,72 @@ namespace infini_train::kernels::cuda {
         }                                                                                                              \
     } while (0)
 
+namespace {
+// 矩阵乘的形状信息：最后两维参与乘法，其余前置维度折叠成 batch。
+struct MatmulDims {
+    int64_t m = 0;        // input 的倒数第二维
+    int64_t k = 0;        // 收缩维
+    int64_t n = 0;        // other 的最后一维
+    int64_t input_bs = 1; // input 折叠后的 batch 数
+    int64_t other_bs = 1; // other 折叠后的 batch 数
+    int64_t bs = 1;       // 广播后的 batch 数
+};
+
+MatmulDims ComputeMatmulDims(const std::vector<int64_t> &input_dims, const std::vector<int64_t> &other_dims) {
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_GE(other_dims.size(), 2);
+
+    MatmulDims d;
+    d.m = input_dims[input_dims.size() - 2];
+    d.k = *input_dims.rbegin();
+    CHECK_EQ(other_dims[other_dims.size() - 2], d.k)
+        << "matmul shape mismatch: input's last dim must equal other's second-to-last dim";
+    d.n = *other_dims.rbegin();
+
+    d.input_bs = std::accumulate(input_dims.begin(), input_dims.end() - 2, int64_t{1}, std::multiplies<int64_t>{});
+    d.other_bs = std::accumulate(other_dims.begin(), other_dims.end() - 2, int64_t{1}, std::multiplies<int64_t>{});
+    d.bs = std::max(d.input_bs, d.other_bs);
+    CHECK(d.input_bs == d.bs || d.input_bs == 1) << "unsupported batch broadcast on input";
+    CHECK(d.other_bs == d.bs || d.other_bs == 1) << "unsupported batch broadcast on other";
+    return d;
+}
+} // namespace
+
 std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
     // =================================== 作业 ===================================
     // TODO：实现CUDA上的矩阵乘法前向计算
     // REF:
     // =================================== 作业 ===================================
 
-    auto output = std::make_shared<Tensor>();
+    /*
+      input: (*, m, k) @ other: (*, k, n) -> output: (*, m, n)，数据均为行主序。
+      cuBLAS 采用列主序，行主序矩阵 X(a, b) 在列主序下即 X^T(b, a)，因此
+        output = input @ other   <==>   output^T = other^T @ input^T
+      直接把 other 当作第一个操作数、input 当作第二个操作数传给 cublas 即可，
+      无需任何显式转置（与本文件中 LinearForward 的处理方式一致）。
+      广播的一侧把 stride 置 0，让所有 batch 复用同一块显存。
+    */
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    const auto d = ComputeMatmulDims(input_dims, other_dims);
+
+    auto output_dims = d.input_bs >= d.other_bs ? std::vector<int64_t>(input_dims.begin(), input_dims.end() - 2)
+                                                : std::vector<int64_t>(other_dims.begin(), other_dims.end() - 2);
+    output_dims.push_back(d.m);
+    output_dims.push_back(d.n);
+    auto output = std::make_shared<Tensor>(output_dims, DataType::kFLOAT32, input->GetDevice());
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    // C^T[n, m] = other^T[n, k] * input^T[k, m]
+    CUBLAS_CHECK(cublasSgemmStridedBatched(
+        handle, CUBLAS_OP_N, CUBLAS_OP_N, d.n, d.m, d.k, &alpha, static_cast<const float *>(other->DataPtr()), d.n,
+        d.other_bs == 1 ? 0 : d.k * d.n, static_cast<const float *>(input->DataPtr()), d.k,
+        d.input_bs == 1 ? 0 : d.m * d.k, &beta, static_cast<float *>(output->DataPtr()), d.n, d.m * d.n, d.bs));
+    CUBLAS_CHECK(cublasDestroy(handle));
+
     return output;
 }
 
@@ -41,8 +104,74 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     // REF:
     // =================================== 作业 ===================================
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    /*
+      grad_input[*, m, k] = grad_output[*, m, n] @ other[*, k, n]^T
+      grad_other[*, k, n] = input[*, m, k]^T @ grad_output[*, m, n]
+      同样按列主序做等价换位：
+        grad_input^T[k, m] = other[k, n](列主序视作 other^T) ... 见下方各次调用的注释。
+      若某一侧发生 batch 广播，其梯度需在 batch 维上累加，此时退化为逐 batch
+      调用并令 beta = 1 累积，避免 strided batched 写同一块显存产生竞争。
+    */
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    const auto d = ComputeMatmulDims(input_dims, other_dims);
+    CHECK_EQ(grad_output->NumElements(), d.bs * d.m * d.n);
+
+    auto grad_input = std::make_shared<Tensor>(input_dims, DataType::kFLOAT32, input->GetDevice());
+    auto grad_other = std::make_shared<Tensor>(other_dims, DataType::kFLOAT32, other->GetDevice());
+
+    const auto *input_ptr = static_cast<const float *>(input->DataPtr());
+    const auto *other_ptr = static_cast<const float *>(other->DataPtr());
+    const auto *grad_output_ptr = static_cast<const float *>(grad_output->DataPtr());
+    auto *grad_input_ptr = static_cast<float *>(grad_input->DataPtr());
+    auto *grad_other_ptr = static_cast<float *>(grad_other->DataPtr());
+
+    const float alpha = 1.0f;
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+
+    // ---- grad_input = grad_output @ other^T ----
+    // 列主序：C[k, m] = op(other)[k, n] * op(grad_output)[n, m]
+    // other 行主序 (k, n) -> 列主序 (n, k)，需转置得到 (k, n)，故 opA = T，lda = n
+    // grad_output 行主序 (m, n) -> 列主序 (n, m)，直接可用，opB = N，ldb = n
+    if (d.input_bs == d.bs) {
+        const float beta = 0.0f;
+        CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_T, CUBLAS_OP_N, d.k, d.m, d.n, &alpha, other_ptr, d.n,
+                                               d.other_bs == 1 ? 0 : d.k * d.n, grad_output_ptr, d.n, d.m * d.n, &beta,
+                                               grad_input_ptr, d.k, d.m * d.k, d.bs));
+    } else {
+        // input 被广播：所有 batch 的梯度累加到同一块显存
+        const float beta = 1.0f;
+        CUDA_CHECK(cudaMemset(grad_input_ptr, 0, grad_input->SizeInBytes()));
+        for (int64_t b = 0; b < d.bs; ++b) {
+            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, d.k, d.m, d.n, &alpha,
+                                     other_ptr + (d.other_bs == 1 ? 0 : b * d.k * d.n), d.n,
+                                     grad_output_ptr + b * d.m * d.n, d.n, &beta, grad_input_ptr, d.k));
+        }
+    }
+
+    // ---- grad_other = input^T @ grad_output ----
+    // 列主序：C[n, k] = op(grad_output)[n, m] * op(input)[m, k]
+    // grad_output 行主序 (m, n) -> 列主序 (n, m)，opA = N，lda = n
+    // input 行主序 (m, k) -> 列主序 (k, m)，需转置得到 (m, k)，故 opB = T，ldb = k
+    if (d.other_bs == d.bs) {
+        const float beta = 0.0f;
+        CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T, d.n, d.k, d.m, &alpha, grad_output_ptr,
+                                               d.n, d.m * d.n, input_ptr, d.k, d.input_bs == 1 ? 0 : d.m * d.k, &beta,
+                                               grad_other_ptr, d.n, d.k * d.n, d.bs));
+    } else {
+        // other 被广播：所有 batch 的梯度累加到同一块显存
+        const float beta = 1.0f;
+        CUDA_CHECK(cudaMemset(grad_other_ptr, 0, grad_other->SizeInBytes()));
+        for (int64_t b = 0; b < d.bs; ++b) {
+            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, d.n, d.k, d.m, &alpha,
+                                     grad_output_ptr + b * d.m * d.n, d.n,
+                                     input_ptr + (d.input_bs == 1 ? 0 : b * d.m * d.k), d.k, &beta, grad_other_ptr,
+                                     d.n));
+        }
+    }
+
+    CUBLAS_CHECK(cublasDestroy(handle));
     return {grad_input, grad_other};
 }
 

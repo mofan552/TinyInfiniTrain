@@ -11,7 +11,12 @@ std::vector<std::shared_ptr<Tensor>> Neg::Forward(const std::vector<std::shared_
     // NOTES: 依赖test_dispatcher，Neg kernel实现已给出
     // =================================== 作业 ===================================
 
-    return std::vector<std::shared_ptr<Tensor>>();
+    CHECK_EQ(input_tensors.size(), 1);
+    const auto &input = input_tensors[0];
+
+    auto device = input->GetDevice().Type();
+    auto kernel = Dispatcher::Instance().GetKernel({device, "NegForward"});
+    return {kernel.Call<std::shared_ptr<Tensor>>(input)};
 }
 
 std::vector<std::shared_ptr<Tensor>> Neg::Backward(const std::vector<std::shared_ptr<Tensor>> &grad_outputs) {
@@ -20,7 +25,14 @@ std::vector<std::shared_ptr<Tensor>> Neg::Backward(const std::vector<std::shared
     // NOTES: 依赖test_dispatcher，Neg的kernel实现已给出
     // =================================== 作业 ===================================
 
-    return std::vector<std::shared_ptr<Tensor>>();
+    // d(-x)/dx = -1，反向不依赖前向的输入，因此无需 SetupContext 保存张量，
+    // 设备信息直接取自 grad_output（测例会绕过 Forward 单独调用 Backward）。
+    CHECK_EQ(grad_outputs.size(), 1);
+    const auto &grad_output = grad_outputs[0];
+
+    auto device = grad_output->GetDevice().Type();
+    auto kernel = Dispatcher::Instance().GetKernel({device, "NegBackward"});
+    return {kernel.Call<std::shared_ptr<Tensor>>(grad_output)};
 }
 
 std::vector<std::shared_ptr<Tensor>> Reciprocal::Forward(const std::vector<std::shared_ptr<Tensor>> &input_tensors) {
