@@ -61,14 +61,61 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
     | magic(4B) | version(4B) | num_toks(4B) | reserved(1012B) | token数据           |
     ----------------------------------------------------------------------------------
        =================================== 作业 =================================== */
+
+    constexpr size_t kHeaderSizeInBytes = 1024;
+
+    std::ifstream ifs(path, std::ios::binary);
+    CHECK(ifs.is_open()) << "Failed to open dataset file: " << path;
+
+    const auto header = ReadSeveralBytesFromIfstream(kHeaderSizeInBytes, &ifs);
+    const int32_t magic = BytesToType<int32_t>(header, 0);
+    const int32_t version = BytesToType<int32_t>(header, 4);
+    const int32_t num_tokens = BytesToType<int32_t>(header, 8);
+    CHECK(kTypeMap.count(magic)) << "Unsupported dataset magic number: " << magic;
+    CHECK_GT(num_tokens, 0) << "Empty dataset file: " << path;
+    LOG(INFO) << "dataset " << path << ": magic=" << magic << " version=" << version << " num_tokens=" << num_tokens;
+
+    const auto type = kTypeMap.at(magic);
+    const size_t token_size_in_bytes = kTypeToSize.at(type);
+
+    // 按 sequence_length 切成整行，多余的尾部 token 丢弃。
+    // 注意最后一行只用于给倒数第二行提供右移一位的标签，因此可用样本数为 num_sequences - 1。
+    const int64_t num_sequences = static_cast<int64_t>(num_tokens / sequence_length);
+    CHECK_GE(num_sequences, 2) << "dataset too small for sequence_length=" << sequence_length;
+
+    TinyShakespeareFile result;
+    result.type = type;
+    result.dims = {num_sequences, static_cast<int64_t>(sequence_length)};
+
+    // 下游 EmbeddingForward 要求索引张量为 INT64，这里统一把 uint16/uint32 提升为 int64 存放
+    result.tensor = infini_train::Tensor(result.dims, DataType::kINT64);
+    const size_t num_elements = static_cast<size_t>(num_sequences) * sequence_length;
+    const auto raw = ReadSeveralBytesFromIfstream(num_elements * token_size_in_bytes, &ifs);
+    auto *dst = static_cast<int64_t *>(result.tensor.DataPtr());
+    for (size_t idx = 0; idx < num_elements; ++idx) {
+        dst[idx] = type == TinyShakespeareType::kUINT16
+                     ? static_cast<int64_t>(BytesToType<uint16_t>(raw, idx * token_size_in_bytes))
+                     : static_cast<int64_t>(BytesToType<uint32_t>(raw, idx * token_size_in_bytes));
+    }
+
+    return result;
 }
 } // namespace
 
-TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length) {
+TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length)
+    // 三个成员均为 const，只能在初始化列表中赋值；初始化顺序与声明顺序一致，
+    // text_file_ 先于 num_samples_ 构造，因此可以直接用它的 dims 推导样本数。
+    : text_file_(ReadTinyShakespeareFile(filepath, sequence_length)), sequence_length_(sequence_length),
+      sequence_size_in_bytes_(sequence_length * sizeof(int64_t)),
+      num_samples_(static_cast<size_t>(text_file_.dims[0]) - 1) {
     // =================================== 作业 ===================================
     // TODO：初始化数据集实例
     // HINT: 调用ReadTinyShakespeareFile加载数据文件
     // =================================== 作业 ===================================
+
+    CHECK_EQ(text_file_.dims.size(), 2);
+    CHECK_EQ(static_cast<size_t>(text_file_.dims[1]), sequence_length_);
+    LOG(INFO) << "TinyShakespeareDataset: " << num_samples_ << " samples, sequence_length=" << sequence_length_;
 }
 
 std::pair<std::shared_ptr<infini_train::Tensor>, std::shared_ptr<infini_train::Tensor>>

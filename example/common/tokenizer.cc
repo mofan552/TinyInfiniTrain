@@ -78,6 +78,32 @@ Tokenizer::Tokenizer(const std::string &filepath) {
     | magic(4B) | version(4B) | vocab_size(4B) | reserved(1012B) | token词表数据       |
     ----------------------------------------------------------------------------------
     ===================================== 作业 ===================================== */
+
+    constexpr size_t kHeaderSizeInBytes = 1024;
+
+    std::ifstream ifs(filepath, std::ios::binary);
+    CHECK(ifs.is_open()) << "Failed to open tokenizer file: " << filepath;
+
+    const auto header = ReadSeveralBytesFromIfstream(kHeaderSizeInBytes, &ifs);
+    magic_number_ = BytesToType<uint32_t>(header, 0);
+    CHECK(kEotMap.count(magic_number_)) << "Unsupported tokenizer magic number: " << magic_number_;
+    const auto version = static_cast<Version>(BytesToType<uint32_t>(header, 4));
+    vocab_size_ = BytesToType<uint32_t>(header, 8);
+
+    // v1 的头部没有 eot 字段，按 magic 查表；v2 直接从头部第 4 个 int32 读取
+    eot_token_ = version == Version::kV2 ? BytesToType<uint32_t>(header, 12) : kEotMap.at(magic_number_);
+
+    // 词表区：每个 token 由 1 字节长度 + 该长度的原始字节组成
+    token_table_.reserve(vocab_size_);
+    for (uint32_t idx = 0; idx < vocab_size_; ++idx) {
+        const auto length_bytes = ReadSeveralBytesFromIfstream(1, &ifs);
+        const size_t length = static_cast<size_t>(length_bytes[0]);
+        const auto token_bytes = ReadSeveralBytesFromIfstream(length, &ifs);
+        token_table_.emplace_back(reinterpret_cast<const char *>(token_bytes.data()), length);
+    }
+    CHECK_EQ(token_table_.size(), vocab_size_);
+    LOG(INFO) << "Tokenizer loaded: magic=" << magic_number_ << " vocab_size=" << vocab_size_
+              << " eot_token=" << eot_token_;
 }
 
 std::string Tokenizer::Decode(uint32_t token_id) const {
@@ -85,7 +111,12 @@ std::string Tokenizer::Decode(uint32_t token_id) const {
     TODO：实现token_id到文本的转换
     功能描述：根据token_id返回对应的文本片段
     ===================================== 作业 ===================================== */
-    return "";
+
+    if (token_id >= vocab_size_) {
+        LOG(ERROR) << "invalid token id: " << token_id << " (vocab_size=" << vocab_size_ << ")";
+        return "";
+    }
+    return token_table_[token_id];
 }
 
 void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_size, uint32_t sequence_length,
@@ -104,13 +135,35 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
     std::cout << "The meaning of life is";
 
     auto x = std::make_shared<infini_train::Tensor>(x_tensor.To(device));
-    uint64_t kRngState = kRngState;
+    // 原写法 `uint64_t kRngState = kRngState;` 是自我初始化（未定义行为），
+    // 且会遮蔽文件顶部的常量种子，这里改名并用常量种子显式初始化。
+    uint64_t rng_state = kRngState;
     LOG(INFO) << "start generate text:";
     for (int t = prompt_len; t < text_length; t++) {
         /* ===================================== 作业 =====================================
         TODO：实现单步文本生成逻辑
         HINT：调用model.Forward推理获取logits，根据推理结果进行随机采样，调用Decode获取文本结果
         ===================================== 作业 ===================================== */
+
+        // (bs, seq_len) -> GPT2 -> (bs, seq_len, vocab_size)
+        auto logits = model.Forward({x})[0];
+        // 在词表维做 softmax 得到概率分布
+        auto probs = nn::function::Softmax(logits, -1);
+        // 采样只在 CPU 上做，把结果搬回主机
+        auto probs_cpu = probs->To(Device());
+
+        const int64_t vocab_size = *probs_cpu.Dims().rbegin();
+        // 取 batch 0 中位置 t-1 的分布，用它预测第 t 个 token
+        auto *probs_ptr = static_cast<float *>(probs_cpu.DataPtr()) + static_cast<int64_t>(t - 1) * vocab_size;
+
+        const float coin = RandomF32(rng_state);
+        const uint32_t next_token = static_cast<uint32_t>(SampleMult(probs_ptr, vocab_size, coin));
+
+        std::cout << Decode(next_token) << std::flush;
+
+        // 把采样结果写回输入序列（各 batch 保持一致），再同步到设备上继续下一步
+        for (int b = 0; b < batch_size; ++b) { x_buff[b * sequence_length + t] = next_token; }
+        x = std::make_shared<infini_train::Tensor>(x_tensor.To(device));
     }
     std::cout << std::endl;
 }
