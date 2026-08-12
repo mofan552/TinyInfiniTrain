@@ -82,15 +82,24 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     output_dims.push_back(d.n);
     auto output = std::make_shared<Tensor>(output_dims, DataType::kFLOAT32, input->GetDevice());
 
+    const auto *input_ptr = static_cast<const float *>(input->DataPtr());
+    const auto *other_ptr = static_cast<const float *>(other->DataPtr());
+    auto *output_ptr = static_cast<float *>(output->DataPtr());
+
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
-    // C^T[n, m] = other^T[n, k] * input^T[k, m]
-    CUBLAS_CHECK(cublasSgemmStridedBatched(
-        handle, CUBLAS_OP_N, CUBLAS_OP_N, d.n, d.m, d.k, &alpha, static_cast<const float *>(other->DataPtr()), d.n,
-        d.other_bs == 1 ? 0 : d.k * d.n, static_cast<const float *>(input->DataPtr()), d.k,
-        d.input_bs == 1 ? 0 : d.m * d.k, &beta, static_cast<float *>(output->DataPtr()), d.n, d.m * d.n, d.bs));
+    // 强制严格 FP32：禁用 TF32 张量核以及 split-k 等会改变累加顺序的快速路径，
+    // 保证结果与参考实现在数值上尽可能一致
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH));
+    for (int64_t b = 0; b < d.bs; ++b) {
+        // C^T[n, m] = other^T[n, k] * input^T[k, m]
+        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, d.n, d.m, d.k, &alpha,
+                                 other_ptr + (d.other_bs == 1 ? 0 : b * d.k * d.n), d.n,
+                                 input_ptr + (d.input_bs == 1 ? 0 : b * d.m * d.k), d.k, &beta,
+                                 output_ptr + b * d.m * d.n, d.n));
+    }
     CUBLAS_CHECK(cublasDestroy(handle));
 
     return output;
@@ -129,46 +138,39 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     const float alpha = 1.0f;
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH));
 
-    // ---- grad_input = grad_output @ other^T ----
-    // 列主序：C[k, m] = op(other)[k, n] * op(grad_output)[n, m]
-    // other 行主序 (k, n) -> 列主序 (n, k)，需转置得到 (k, n)，故 opA = T，lda = n
-    // grad_output 行主序 (m, n) -> 列主序 (n, m)，直接可用，opB = N，ldb = n
-    if (d.input_bs == d.bs) {
-        const float beta = 0.0f;
-        CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_T, CUBLAS_OP_N, d.k, d.m, d.n, &alpha, other_ptr, d.n,
-                                               d.other_bs == 1 ? 0 : d.k * d.n, grad_output_ptr, d.n, d.m * d.n, &beta,
-                                               grad_input_ptr, d.k, d.m * d.k, d.bs));
-    } else {
-        // input 被广播：所有 batch 的梯度累加到同一块显存
-        const float beta = 1.0f;
+    // 广播的一侧需要在 batch 维累加，先清零再用 beta = 1 累积；未广播时直接覆盖写入
+    const bool accumulate_grad_input = d.input_bs != d.bs;
+    const bool accumulate_grad_other = d.other_bs != d.bs;
+    if (accumulate_grad_input) {
         CUDA_CHECK(cudaMemset(grad_input_ptr, 0, grad_input->SizeInBytes()));
-        for (int64_t b = 0; b < d.bs; ++b) {
-            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, d.k, d.m, d.n, &alpha,
-                                     other_ptr + (d.other_bs == 1 ? 0 : b * d.k * d.n), d.n,
-                                     grad_output_ptr + b * d.m * d.n, d.n, &beta, grad_input_ptr, d.k));
-        }
     }
-
-    // ---- grad_other = input^T @ grad_output ----
-    // 列主序：C[n, k] = op(grad_output)[n, m] * op(input)[m, k]
-    // grad_output 行主序 (m, n) -> 列主序 (n, m)，opA = N，lda = n
-    // input 行主序 (m, k) -> 列主序 (k, m)，需转置得到 (m, k)，故 opB = T，ldb = k
-    if (d.other_bs == d.bs) {
-        const float beta = 0.0f;
-        CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T, d.n, d.k, d.m, &alpha, grad_output_ptr,
-                                               d.n, d.m * d.n, input_ptr, d.k, d.input_bs == 1 ? 0 : d.m * d.k, &beta,
-                                               grad_other_ptr, d.n, d.k * d.n, d.bs));
-    } else {
-        // other 被广播：所有 batch 的梯度累加到同一块显存
-        const float beta = 1.0f;
+    if (accumulate_grad_other) {
         CUDA_CHECK(cudaMemset(grad_other_ptr, 0, grad_other->SizeInBytes()));
-        for (int64_t b = 0; b < d.bs; ++b) {
-            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, d.n, d.k, d.m, &alpha,
-                                     grad_output_ptr + b * d.m * d.n, d.n,
-                                     input_ptr + (d.input_bs == 1 ? 0 : b * d.m * d.k), d.k, &beta, grad_other_ptr,
-                                     d.n));
-        }
+    }
+    const float beta_input = accumulate_grad_input ? 1.0f : 0.0f;
+    const float beta_other = accumulate_grad_other ? 1.0f : 0.0f;
+
+    for (int64_t b = 0; b < d.bs; ++b) {
+        const int64_t input_b = d.input_bs == 1 ? 0 : b;
+        const int64_t other_b = d.other_bs == 1 ? 0 : b;
+
+        // ---- grad_input = grad_output @ other^T ----
+        // 列主序：C[k, m] = op(other)[k, n] * op(grad_output)[n, m]
+        // other 行主序 (k, n) -> 列主序 (n, k)，需转置得到 (k, n)，故 opA = T，lda = n
+        // grad_output 行主序 (m, n) -> 列主序 (n, m)，直接可用，opB = N，ldb = n
+        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, d.k, d.m, d.n, &alpha,
+                                 other_ptr + other_b * d.k * d.n, d.n, grad_output_ptr + b * d.m * d.n, d.n,
+                                 &beta_input, grad_input_ptr + input_b * d.m * d.k, d.k));
+
+        // ---- grad_other = input^T @ grad_output ----
+        // 列主序：C[n, k] = op(grad_output)[n, m] * op(input)[m, k]
+        // grad_output 行主序 (m, n) -> 列主序 (n, m)，opA = N，lda = n
+        // input 行主序 (m, k) -> 列主序 (k, m)，需转置得到 (m, k)，故 opB = T，ldb = k
+        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, d.n, d.k, d.m, &alpha,
+                                 grad_output_ptr + b * d.m * d.n, d.n, input_ptr + input_b * d.m * d.k, d.k,
+                                 &beta_other, grad_other_ptr + other_b * d.k * d.n, d.n));
     }
 
     CUBLAS_CHECK(cublasDestroy(handle));
