@@ -39,7 +39,8 @@ public:
     }
 
     const KernelFunction &GetKernel(KeyT key) const {
-        CHECK(key_to_kernel_map_.contains(key))
+        // 用 count 代替 C++20 的 contains：语义完全一致，但 nvcc 在 C++17 下也能编译
+        CHECK(key_to_kernel_map_.count(key))
             << "Kernel not found: " << key.second << " on device: " << static_cast<int>(key.first);
         return key_to_kernel_map_.at(key);
     }
@@ -50,7 +51,7 @@ public:
         // 功能描述：将kernel函数与设备类型、名称绑定
         // =================================== 作业 ===================================
 
-        CHECK(!key_to_kernel_map_.contains(key))
+        CHECK(!key_to_kernel_map_.count(key))
             << "Kernel already registered: " << key.second << " on device: " << static_cast<int>(key.first);
         key_to_kernel_map_.emplace(key, KernelFunction(std::forward<FuncT>(kernel)));
     }
